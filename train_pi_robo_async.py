@@ -420,51 +420,56 @@ def main(_):
             done, success, reward, mask = env.get_info_for_step()
         sink.label_last(reward, mask, done)  # outcome of the previous action
 
-        # Start the next chunk's inference once exactly `delay` actions remain in the plan.
-        sampler.launch(_actor_agent, observation, len(action_plan), action_type)
+        if not done:
+            # Start the next chunk's inference once exactly `delay` actions remain in the plan.
+            sampler.launch(_actor_agent, observation, len(action_plan), action_type)
 
-        with timer.context("plan"):
-            # Skip model inference while human is controlling.
-            if not action_plan and action_type != "human":
-                sample_start = time.time()
-                action_chunk, _actor_agent, sample_info = sampler.sample(_actor_agent, observation, step_metrics)
-                episode_log.sample_info_history.append(sample_info)
-                action_chunk = np.asarray(jax.device_get(action_chunk[:FLAGS.replan_steps]))
-                training_log.record_sample_time(time.time() - sample_start, step_metrics)
-                action_plan.extend(action_chunk)
-                # Re-check with the refilled plan (covers delay == replan_steps).
-                sampler.launch(_actor_agent, observation, len(action_plan), action_type)
-            else:
-                episode_log.sample_info_history.append(
-                    episode_log.sample_info_history[-1] if episode_log.sample_info_history else None
-                )
+            with timer.context("plan"):
+                # Skip model inference while human is controlling.
+                if not action_plan and action_type != "human":
+                    sample_start = time.time()
+                    action_chunk, _actor_agent, sample_info = sampler.sample(_actor_agent, observation, step_metrics)
+                    episode_log.sample_info_history.append(sample_info)
+                    action_chunk = np.asarray(jax.device_get(action_chunk[:FLAGS.replan_steps]))
+                    training_log.record_sample_time(time.time() - sample_start, step_metrics)
+                    action_plan.extend(action_chunk)
+                    # Re-check with the refilled plan (covers delay == replan_steps).
+                    sampler.launch(_actor_agent, observation, len(action_plan), action_type)
+                else:
+                    episode_log.sample_info_history.append(
+                        episode_log.sample_info_history[-1] if episode_log.sample_info_history else None
+                    )
 
-        # Pacing is anchored to the previous step's dispatch time, not its return, so latency does not accumulate.
-        sleep_left = 0.0 if last_control_start is None else dt - (time.time() - last_control_start)
-        step_metrics["timing/sleep_left_ms"] = sleep_left * 1000.0
-        with timer.context("wait"):
-            if sleep_left > 0:
-                time.sleep(sleep_left)
+            # Pacing is anchored to the previous step's dispatch time, not its return, so latency does not accumulate.
+            sleep_left = 0.0 if last_control_start is None else dt - (time.time() - last_control_start)
+            step_metrics["timing/sleep_left_ms"] = sleep_left * 1000.0
+            with timer.context("wait"):
+                if sleep_left > 0:
+                    time.sleep(sleep_left)
 
-        has_action = bool(action_plan)
-        action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
+            has_action = bool(action_plan)
+            action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
 
-        with timer.context("act"):
-            last_control_start = time.time()
-            real_action, action_type = env.step(action.tolist())
+            with timer.context("act"):
+                last_control_start = time.time()
+                real_action, action_type = env.step(action.tolist())
 
         # Wire time of this step's env RPCs, as measured by the client wrapper.
         step_metrics["timing/network_ms"] = env.pop_network_ms()
         timer.tock("total")
         timer.tick("post_step")
-        episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
+        if not done:
+            episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
+        else:
+            # The terminal reward belongs to the preceding action, not a new step.
+            episode_log.ep_return += reward
 
         # A human override discards the plan and any in-flight inference.
-        if action_type == "human":
+        if not done and action_type == "human":
             action_plan.clear()
             sampler.on_human_takeover()
 
-        if (has_action or action_type == "human") and not done:
+        if not done and (has_action or action_type == "human"):
             transition = dict(
                 observations=observation,
                 actions=real_action,
