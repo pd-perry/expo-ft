@@ -404,6 +404,13 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             params=critic_params,
             tx=optax.GradientTransformation(lambda _: None, lambda _: None),
         )
+        target_critic_shape = jax.eval_shape(lambda: target_critic)
+        target_critic_sharding = _sharding.fsdp_sharding(target_critic_shape, mesh, log=True)
+        target_critic = jax.jit(
+            lambda x: x,
+            in_shardings=replicated_sharding,
+            out_shardings=target_critic_sharding,
+        )(target_critic)
 
         temp_def = Temperature(init_temperature)
         temp_params = temp_def.init(temp_key)["params"]
